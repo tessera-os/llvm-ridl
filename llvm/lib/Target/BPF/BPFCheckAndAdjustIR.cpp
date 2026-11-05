@@ -21,6 +21,7 @@
 
 #include "BPF.h"
 #include "BPFCORE.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/Analysis.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -31,6 +32,7 @@
 #include "llvm/IR/IntrinsicsBPF.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/IR/ProfDataUtils.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Pass.h"
@@ -293,6 +295,9 @@ static bool sinkMinMaxInBB(BasicBlock &BB,
       // x < max(a, b) -> x < a || x < b
       Replacement = Builder.CreateLogicalOr(LHS, RHS);
 
+    if (SelectInst *ReplacementInst = dyn_cast<SelectInst>(Replacement))
+      setExplicitlyUnknownBranchWeightsIfProfiled(*ReplacementInst, DEBUG_TYPE);
+
     ICmp->replaceAllUsesWith(Replacement);
 
     Instruction *ToRemove[] = {ICmp, Info.ZExt, Info.SExt, MinMax};
@@ -439,7 +444,7 @@ static Value *aspaceWrapValue(DenseMap<Value *, Value *> &Cache, Function *F,
     return NewGEP;
   }
 
-  IRBuilder IB(F->getContext());
+  IRBuilder IB(*F->getParent());
   if (Instruction *InsnPtr = dyn_cast<Instruction>(ToWrap))
     IB.SetInsertPoint(*InsnPtr->getInsertionPointAfterDef());
   else
@@ -647,6 +652,52 @@ static bool insertASpaceCasts(Module &M) {
   return Changed;
 }
 
+// There is no range check in front of a jump table when the default of the
+// switch is unreachable. The compiler knows that the value is one of the cases,
+// e.g. the discriminant of an enum that was loaded from memory. The verifier
+// doesn't and rejects the load from the table.
+//
+// Anything can be the default of such a switch. Take the destination that most
+// cases go to and drop these cases. A switch that becomes compares needs as
+// many of them as before.
+static bool giveSwitchesDefault(Module &M) {
+  bool Changed = false;
+
+  for (Function &F : M) {
+    for (BasicBlock &BB : F) {
+      auto *SI = dyn_cast<SwitchInst>(BB.getTerminator());
+
+      if (!SI || !SI->getNumCases() ||
+          !isa<UnreachableInst>(*SI->getDefaultDest()->getFirstNonPHIIt()))
+        continue;
+
+      MapVector<BasicBlock *, unsigned> Cnt;
+      for (auto &Case : SI->cases())
+        ++Cnt[Case.getCaseSuccessor()];
+      BasicBlock *Dest = max_element(Cnt, [](const auto &A, const auto &B) {
+                           return A.second < B.second;
+                         })->first;
+
+      for (PHINode &Phi : Dest->phis())
+        Phi.addIncoming(Phi.getIncomingValueForBlock(&BB), &BB);
+      SI->getDefaultDest()->removePredecessor(&BB);
+      SI->setDefaultDest(Dest);
+
+      SwitchInstProfUpdateWrapper SIW(*SI);
+      for (auto It = SIW->case_begin(); It != SIW->case_end();) {
+        if (It->getCaseSuccessor() != Dest) {
+          ++It;
+          continue;
+        }
+        Dest->removePredecessor(&BB);
+        It = SIW.removeCase(It);
+      }
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
 static bool adjustIR(Module &M,
                      function_ref<LoopInfo &(Function &)> GetLoopInfo) {
   bool Changed = removePassThroughBuiltin(M);
@@ -654,6 +705,7 @@ static bool adjustIR(Module &M,
   Changed = sinkMinMax(M, GetLoopInfo) || Changed;
   Changed = removeGEPBuiltins(M) || Changed;
   Changed = insertASpaceCasts(M) || Changed;
+  Changed = giveSwitchesDefault(M) || Changed;
   return Changed;
 }
 

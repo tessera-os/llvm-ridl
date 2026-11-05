@@ -29,14 +29,6 @@
 
 using namespace llvm;
 
-static cl::opt<bool> DisableCostPerUse("riscv-disable-cost-per-use",
-                                       cl::init(false), cl::Hidden);
-static cl::opt<bool>
-    DisableRegAllocHints("riscv-disable-regalloc-hints", cl::Hidden,
-                         cl::init(false),
-                         cl::desc("Disable two address hints for register "
-                                  "allocation"));
-
 static_assert(RISCV::X1 == RISCV::X0 + 1, "Register list not consecutive");
 static_assert(RISCV::X31 == RISCV::X0 + 31, "Register list not consecutive");
 static_assert(RISCV::F1_H == RISCV::F0_H + 1, "Register list not consecutive");
@@ -96,38 +88,27 @@ RISCVRegisterInfo::getCalleeSavedRegs(const MachineFunction *MF) const {
       MF->getFunction().getCallingConv() == CallingConv::RISCV_VectorCall &&
       Subtarget.hasVInstructions();
 
-  switch (Subtarget.getTargetABI()) {
-  default:
-    llvm_unreachable("Unrecognized ABI");
-  case RISCVABI::ABI_ILP32E:
-  case RISCVABI::ABI_LP64E:
+  RISCVABI::ABI ABI = Subtarget.getTargetABI();
+  assert(ABI != RISCVABI::ABI::Unknown && !RISCVABI::isPurecap(ABI) &&
+         "Unrecognized ABI");
+  if (RISCVABI::isRVE(ABI))
     return CSR_ILP32E_LP64E_SaveList;
-  case RISCVABI::ABI_ILP32:
-  case RISCVABI::ABI_LP64:
-    if (HasVectorCSR)
-      return CSR_ILP32_LP64_V_SaveList;
-    return CSR_ILP32_LP64_SaveList;
-  case RISCVABI::ABI_ILP32F:
-  case RISCVABI::ABI_LP64F:
-    if (HasVectorCSR)
-      return CSR_ILP32F_LP64F_V_SaveList;
-    return CSR_ILP32F_LP64F_SaveList;
-  case RISCVABI::ABI_ILP32D:
-  case RISCVABI::ABI_LP64D:
-    if (HasVectorCSR)
-      return CSR_ILP32D_LP64D_V_SaveList;
-    return CSR_ILP32D_LP64D_SaveList;
-  }
+  if (RISCVABI::isSoftFP(ABI))
+    return HasVectorCSR ? CSR_ILP32_LP64_V_SaveList : CSR_ILP32_LP64_SaveList;
+  if (RISCVABI::isSingleFP(ABI))
+    return HasVectorCSR ? CSR_ILP32F_LP64F_V_SaveList
+                        : CSR_ILP32F_LP64F_SaveList;
+  assert(RISCVABI::isDoubleFP(ABI) && "Unrecognized ABI");
+  return HasVectorCSR ? CSR_ILP32D_LP64D_V_SaveList : CSR_ILP32D_LP64D_SaveList;
 }
 
-const TargetRegisterClass *RISCVRegisterInfo::getConstrainedRegClassForOperand(
-    const MachineOperand &MO, const MachineRegisterInfo &MRI) const {
+const TargetRegisterClass *RISCVRegisterInfo::getConstrainedRegClassForReg(
+    Register Reg, const MachineRegisterInfo &MRI) const {
   const RISCVSubtarget &STI = MRI.getMF().getSubtarget<RISCVSubtarget>();
 
-  const RegClassOrRegBank &RCOrRB = MRI.getRegClassOrRegBank(MO.getReg());
+  const RegClassOrRegBank &RCOrRB = MRI.getRegClassOrRegBank(Reg);
   if (const RegisterBank *RB = dyn_cast<const RegisterBank *>(RCOrRB))
-    return getRegClassForTypeOnBank(MRI.getType(MO.getReg()), *RB,
-                                    STI.is64Bit());
+    return getRegClassForTypeOnBank(MRI.getType(Reg), *RB, STI.is64Bit());
 
   if (const auto *RC = dyn_cast<const TargetRegisterClass *>(RCOrRB)) {
     return getAllocatableClass(RC);
@@ -199,10 +180,6 @@ BitVector RISCVRegisterInfo::getReservedRegs(const MachineFunction &MF) const {
   // variable-sized objects at runtime.
   if (TFI->hasBP(MF))
     markSuperRegs(Reserved, RISCVABI::getBPReg()); // bp
-
-  // Additionally reserve dummy register used to form the register pair
-  // beginning with 'x0' for instructions that take register pairs.
-  markSuperRegs(Reserved, RISCV::DUMMY_REG_PAIR_WITH_X0);
 
   // There are only 16 GPRs for RVE.
   if (Subtarget.hasStdExtE())
@@ -435,6 +412,18 @@ void RISCVRegisterInfo::adjustReg(MachineBasicBlock &MBB,
           .setMIFlag(Flag);
       return;
     }
+  }
+
+  // Emit a PseudoAddUpperImm instead of LUI+ADD when the offset is a multiple
+  // of 4096 and the source is the frame register. The frame register is
+  // invariant after PEI, so MachineLateInstrsCleanup can CSE identical pseudos.
+  // The pseudo is later expanded back to LUI+ADD.
+  if (Flag == MachineInstr::NoFlags && !KillSrcReg && DestReg != SrcReg &&
+      SrcReg == getFrameRegister(MF) && isShiftedInt<20, 12>(Val)) {
+    BuildMI(MBB, II, DL, TII->get(RISCV::PseudoAddUpperImm), DestReg)
+        .addReg(SrcReg)
+        .addImm(static_cast<uint32_t>(Val) >> 12);
+    return;
   }
 
   unsigned Opc = RISCV::ADD;
@@ -877,6 +866,9 @@ bool RISCVRegisterInfo::isArgumentRegister(const MachineFunction &MF,
   if (TRI->isFPRegister(Reg))
     return llvm::is_contained(RISCV::getArgFPRs(STI), Reg);
 
+  if (RISCV::VRRegClass.contains(Reg))
+    return llvm::is_contained(RISCV::getArgVRs(STI), Reg);
+
   return false;
 }
 
@@ -894,33 +886,22 @@ RISCVRegisterInfo::getCallPreservedMask(const MachineFunction & MF,
   if (CC == CallingConv::GHC)
     return CSR_NoRegs_RegMask;
   RISCVABI::ABI ABI = Subtarget.getTargetABI();
+  assert(ABI != RISCVABI::ABI::Unknown && !RISCVABI::isPurecap(ABI) &&
+         "Unrecognized ABI");
   if (CC == CallingConv::PreserveMost) {
-    if (ABI == RISCVABI::ABI_ILP32E || ABI == RISCVABI::ABI_LP64E)
+    if (RISCVABI::isRVE(ABI))
       return CSR_RT_MostRegs_RVE_RegMask;
     return CSR_RT_MostRegs_RegMask;
   }
-  switch (ABI) {
-  default:
-    llvm_unreachable("Unrecognized ABI");
-  case RISCVABI::ABI_ILP32E:
-  case RISCVABI::ABI_LP64E:
+  if (RISCVABI::isRVE(ABI))
     return CSR_ILP32E_LP64E_RegMask;
-  case RISCVABI::ABI_ILP32:
-  case RISCVABI::ABI_LP64:
-    if (CC == CallingConv::RISCV_VectorCall)
-      return CSR_ILP32_LP64_V_RegMask;
-    return CSR_ILP32_LP64_RegMask;
-  case RISCVABI::ABI_ILP32F:
-  case RISCVABI::ABI_LP64F:
-    if (CC == CallingConv::RISCV_VectorCall)
-      return CSR_ILP32F_LP64F_V_RegMask;
-    return CSR_ILP32F_LP64F_RegMask;
-  case RISCVABI::ABI_ILP32D:
-  case RISCVABI::ABI_LP64D:
-    if (CC == CallingConv::RISCV_VectorCall)
-      return CSR_ILP32D_LP64D_V_RegMask;
-    return CSR_ILP32D_LP64D_RegMask;
-  }
+  bool IsVectorCall = CC == CallingConv::RISCV_VectorCall;
+  if (RISCVABI::isSoftFP(ABI))
+    return IsVectorCall ? CSR_ILP32_LP64_V_RegMask : CSR_ILP32_LP64_RegMask;
+  if (RISCVABI::isSingleFP(ABI))
+    return IsVectorCall ? CSR_ILP32F_LP64F_V_RegMask : CSR_ILP32F_LP64F_RegMask;
+  assert(RISCVABI::isDoubleFP(ABI) && "Unrecognized ABI");
+  return IsVectorCall ? CSR_ILP32D_LP64D_V_RegMask : CSR_ILP32D_LP64D_RegMask;
 }
 
 const TargetRegisterClass *
@@ -966,12 +947,20 @@ void RISCVRegisterInfo::getOffsetOpcodes(const StackOffset &Offset,
   }
 }
 
+std::pair<Register, Register>
+RISCVRegisterInfo::getGPRPairSubRegs(MCRegister Pair) const {
+  if (Pair == RISCV::X0_Pair)
+    return {RISCV::X0, RISCV::X0};
+  return {getSubReg(Pair, RISCV::sub_gpr_even),
+          getSubReg(Pair, RISCV::sub_gpr_odd)};
+}
+
 unsigned
 RISCVRegisterInfo::getRegisterCostTableIndex(const MachineFunction &MF) const {
   // Set CostPerUse to 1 only when optimizing for size and RVC exists.
-  return MF.getFunction().hasOptSize() &&
-                 MF.getSubtarget<RISCVSubtarget>().hasStdExtZca() &&
-                 !DisableCostPerUse
+  const auto &ST = MF.getSubtarget<RISCVSubtarget>();
+  return MF.getFunction().hasOptSize() && ST.hasStdExtZca() &&
+                 ST.getCLOpts().cost_per_use
              ? 1
              : 0;
 }
@@ -985,7 +974,7 @@ float RISCVRegisterInfo::getSpillWeightScaleFactor(
 // instruction.
 bool RISCVRegisterInfo::getRegAllocationHints(
     Register VirtReg, ArrayRef<MCPhysReg> Order,
-    SmallVectorImpl<MCPhysReg> &Hints, const MachineFunction &MF,
+    SmallSetVector<MCPhysReg, 16> &Hints, const MachineFunction &MF,
     const VirtRegMap *VRM, const LiveRegMatrix *Matrix) const {
   const MachineRegisterInfo *MRI = &MF.getRegInfo();
   auto &Subtarget = MF.getSubtarget<RISCVSubtarget>();
@@ -1009,7 +998,7 @@ bool RISCVRegisterInfo::getRegAllocationHints(
       // Verify it's valid and available
       if (RISCV::GPRRegClass.contains(TargetReg) &&
           is_contained(Order, TargetReg))
-        Hints.push_back(TargetReg.id());
+        Hints.insert(TargetReg.id());
     }
 
     // Second priority: Try to find consecutive register pairs in the allocation
@@ -1026,14 +1015,14 @@ bool RISCVRegisterInfo::getRegAllocationHints(
       // Don't provide hints that are paired to a reserved register.
       MCRegister Paired = PhysReg + (IsOdd ? -1 : 1);
       if (WantOdd == IsOdd && !MRI->isReserved(Paired))
-        Hints.push_back(PhysReg);
+        Hints.insert(PhysReg);
     }
   }
 
   bool BaseImplRetVal = TargetRegisterInfo::getRegAllocationHints(
       VirtReg, Order, Hints, MF, VRM, Matrix);
 
-  if (!VRM || DisableRegAllocHints)
+  if (!VRM || !MF.getSubtarget<RISCVSubtarget>().getCLOpts().regalloc_hints)
     return BaseImplRetVal;
 
   // Add any two address hints after any copy hints.
@@ -1048,7 +1037,7 @@ bool RISCVRegisterInfo::getRegAllocationHints(
     // physical register is even (or vice versa), we should not add the hint.
     if (PhysReg && (!NeedGPRC || RISCV::GPRCRegClass.contains(PhysReg)) &&
         !MO.getSubReg() && !VRRegMO.getSubReg()) {
-      if (!MRI->isReserved(PhysReg) && !is_contained(Hints, PhysReg))
+      if (!MRI->isReserved(PhysReg) && !Hints.contains(PhysReg))
         TwoAddrHints.insert(PhysReg);
     }
   };
@@ -1176,7 +1165,7 @@ bool RISCVRegisterInfo::getRegAllocationHints(
 
   for (MCPhysReg OrderReg : Order)
     if (TwoAddrHints.count(OrderReg))
-      Hints.push_back(OrderReg);
+      Hints.insert(OrderReg);
 
   return BaseImplRetVal;
 }

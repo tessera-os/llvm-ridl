@@ -272,12 +272,12 @@ XtensaTargetLowering::XtensaTargetLowering(const TargetMachine &TM,
 }
 
 Register XtensaTargetLowering::getExceptionPointerRegister(
-    const Constant *PersonalityFn) const {
+    ExceptionHandling EH, const Constant *PersonalityFn) const {
   return Xtensa::A2;
 }
 
 Register XtensaTargetLowering::getExceptionSelectorRegister(
-    const Constant *PersonalityFn) const {
+    ExceptionHandling EH, const Constant *PersonalityFn) const {
   return Xtensa::A3;
 }
 
@@ -287,9 +287,10 @@ bool XtensaTargetLowering::isOffsetFoldingLegal(
   return false;
 }
 
-bool XtensaTargetLowering::isFPImmLegal(const APFloat &Imm, EVT VT,
-                                        bool ForCodeSize) const {
-  return false;
+TargetLowering::FPImmAction
+XtensaTargetLowering::getFPImmAction(const APFloat &Imm, EVT VT,
+                                     bool ForCodeSize) const {
+  return FPImmAction::ConstantPool;
 }
 
 //===----------------------------------------------------------------------===//
@@ -300,6 +301,7 @@ XtensaTargetLowering::getConstraintType(StringRef Constraint) const {
   if (Constraint.size() == 1) {
     switch (Constraint[0]) {
     case 'r':
+    case 'f':
       return C_RegisterClass;
     default:
       break;
@@ -329,6 +331,10 @@ XtensaTargetLowering::getSingleConstraintMatchWeight(
     if (Ty->isIntegerTy())
       Weight = CW_Register;
     break;
+  case 'f':
+    if (Ty->isFloatingPointTy())
+      Weight = CW_Register;
+    break;
   }
   return Weight;
 }
@@ -343,6 +349,9 @@ XtensaTargetLowering::getRegForInlineAsmConstraint(
       break;
     case 'r': // General-purpose register
       return std::make_pair(0U, &Xtensa::ARRegClass);
+    case 'f': // Floating-point register
+      if (Subtarget.hasSingleFloat())
+        return std::make_pair(0U, &Xtensa::FPRRegClass);
     }
   }
   return TargetLowering::getRegForInlineAsmConstraint(TRI, Constraint, VT);
