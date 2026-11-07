@@ -17,6 +17,7 @@ cmake -S "$Source\llvm" -B $BuildDir -G Ninja `
     -DCMAKE_BUILD_TYPE=Release `
     "-DCMAKE_INSTALL_PREFIX=$InstallDir" `
     -DLLVM_ENABLE_PROJECTS="clang;lld" `
+    -DCLANG_ENABLE_CIR=OFF `
     -DLLVM_TARGETS_TO_BUILD="X86;AArch64;WebAssembly" `
     -DLLVM_DISTRIBUTION_COMPONENTS="clang;clang-resource-headers;lld;llvm-ar;llvm-strip;llvm-objcopy;llvm-nm;llvm-dwarfdump" `
     -DCLANG_ENABLE_STATIC_ANALYZER=OFF `
